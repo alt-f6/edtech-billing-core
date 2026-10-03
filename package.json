@@ -1,0 +1,29 @@
+{
+  "name": "edtech-billing-core",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Race-safe lesson billing, idempotent payment webhooks and enumeration-safe login, extracted from a production EdTech platform.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.12"
+  },
+  "scripts": {
+    "db:migrate": "tsx scripts/migrate.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "mutants": "tsx scripts/mutants.ts"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "pg": "^8.23.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.3"
+  }
+}
