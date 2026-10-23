@@ -6,6 +6,8 @@ The money-handling core of an EdTech platform: lesson billing that stays exact w
 
 I built and run the production platform this comes from (CRM + LMS + payments for an online school, 300+ active students a month). Its code is private, so this repository is a standalone extraction of the parts worth reviewing, rewritten as a small framework-free TypeScript library on plain PostgreSQL. Where this version deliberately differs from production, the [last section](#differences-from-production) says how and why.
 
+**Start here:** [a bug the randomized test caught](#a-bug-the-invariant-test-caught): a double refund that only appears when a lesson is cancelled and then cleared.
+
 ```bash
 docker compose up -d --wait && cp .env.example .env && npm ci && npm test
 ```
@@ -88,6 +90,10 @@ npm run typecheck
 npm test                      # rebuilds the schema of the *_test database on each run
 npm run mutants               # optional: confirms every defence is covered by a test (~2 min)
 ```
+
+## About
+
+Built by Ismail Iusifli, a backend engineer focused on billing, payments and integrations. Open to remote work: [iusifli.dev](https://iusifli.dev) · [LinkedIn](https://linkedin.com/in/ismail-iusifli)
 
 ## License
 
