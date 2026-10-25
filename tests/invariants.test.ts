@@ -64,6 +64,12 @@ const INVARIANTS: Record<string, string> = {
     SELECT student_id FROM ledger_transaction WHERE class_session_id IS NOT NULL
     GROUP BY student_id, class_session_id HAVING SUM(amount) > 0`,
 
+  "a lesson has at most one charge that no reversal names": `
+    SELECT c.student_id FROM ledger_transaction c
+    WHERE c.type = 'LESSON_CHARGE'
+      AND NOT EXISTS (SELECT 1 FROM ledger_transaction r WHERE r.reverses_id = c.id)
+    GROUP BY c.student_id, c.class_session_id HAVING COUNT(*) > 1`,
+
   "each provider payment is credited at most once": `
     SELECT idempotency_key FROM ledger_transaction WHERE type = 'PAYMENT'
     GROUP BY 1 HAVING COUNT(*) > 1`,

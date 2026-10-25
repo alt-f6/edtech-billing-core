@@ -16,7 +16,7 @@ docker compose up -d --wait && cp .env.example .env && npm ci && npm test
 
 | Module | The problem | The design |
 |---|---|---|
-| [`billing`](src/billing/billing.service.ts) | Staff mark, re-mark, clear and cancel lessons concurrently; the student must be charged exactly once, and the ledger must always agree with the attendance journal | **Append-only ledger** (a trigger rejects `UPDATE`/`DELETE`): corrections are reversal rows. Writes for one student are ordered by a `FOR NO KEY UPDATE` lock on the student; cancellations exclude marks via `FOR SHARE` / `FOR UPDATE` on the lesson. One lock order everywhere, so no deadlocks and no lost races to retry |
+| [`billing`](src/billing/billing.service.ts) | Staff mark, re-mark, clear and cancel lessons concurrently; the student must be charged exactly once, and the ledger must always agree with the attendance journal | **Append-only ledger** (a trigger rejects `UPDATE`/`DELETE`): corrections are reversal rows, each naming the charge it reverses, and a `UNIQUE` constraint lets a charge be reversed only once. Writes for one student are ordered by a `FOR NO KEY UPDATE` lock on the student; cancellations exclude marks via `FOR SHARE` / `FOR UPDATE` on the lesson. One lock order everywhere, so no deadlocks and no lost races to retry |
 | [`payments`](src/payments/webhook.handler.ts) | A webhook can be forged, replayed, tampered with, or delivered ten times at once | Rate limit → constant-time secret check (mandatory in live mode) → provider IP allowlist → **re-fetch the payment from the provider's API** and validate the response at runtime → check owner, amount and currency against our own payment intent → credit with `ON CONFLICT DO NOTHING` on the provider's payment id |
 | [`auth`](src/auth/login-rate-limit.ts) | Response time leaks which emails are registered; per-IP limits are bypassed by spoofing `X-Forwarded-For`; check-then-increment limiters let bursts through | Unknown emails still cost one bcrypt compare. Limits per (IP, email) and per email across IPs, checked and counted atomically under a per-email advisory lock, on normalized emails, with IPs stored only as keyed hashes (HMAC) |
 | [`rate-limit`](src/rate-limit/rate-limit.ts) | An in-memory limiter resets on deploy and isn't shared between instances | One atomic `INSERT … ON CONFLICT DO UPDATE` per hit, in Postgres |
@@ -37,20 +37,22 @@ Every billing write takes its locks in the same order:
 
 ## How it's tested
 
-104 tests, all against a real PostgreSQL; no database mocks, because the guarantees live in locks, constraints and triggers.
+110 tests, all against a real PostgreSQL; no database mocks, because the guarantees live in locks, constraints and triggers.
 
 - **Deterministic interleavings.** A test pauses one operation right after it has taken its locks, starts a competing one, and asserts it waits. There is one such test per lock, plus one for the deadlock case above.
 - **Bursts.** 20 simultaneous marks of one lesson, 10 lessons for one student at once, 10 students on one lesson, conflicting PRESENT/EXCUSED marks: every call succeeds and the ledger comes out exact. 10 identical webhook deliveries credit once. 50 parallel login guesses get exactly 5 tries. 100 parallel hits on a limit of 10 let exactly 10 through.
 - **Webhook attacks.** Missing or wrong secret, right secret from a wrong IP, inflated amount in the body, "succeeded" for a payment the provider says is pending, wrong currency, zero amount, amount different from the intent, metadata naming a different student, malformed provider response, provider outage with redelivery.
-- **Randomized ledger invariants.** [`invariants.test.ts`](tests/invariants.test.ts) runs 200 random operations per seed (marks, clears, cancellations, payments and redelivered payments, five at a time in parallel) and checks eight ledger invariants after every batch (one student is on a billing freeze, so the frozen path runs too), plus that the ledger never shrinks. The only refusal it accepts is touching an already-cancelled lesson. Seeded, so a failure replays exactly.
+- **Randomized ledger invariants.** [`invariants.test.ts`](tests/invariants.test.ts) runs 200 random operations per seed (marks, clears, cancellations, payments and redelivered payments, five at a time in parallel) and checks nine ledger invariants after every batch (one student is on a billing freeze, so the frozen path runs too), plus that the ledger never shrinks. The only refusal it accepts is touching an already-cancelled lesson. Seeded, so a failure replays exactly.
 
-**Mutation-checked.** [`npm run mutants`](scripts/mutants.ts) removes each defence in turn in a throwaway copy and runs the suite: either lock, `FOR UPDATE` instead of `FOR NO KEY UPDATE`, the cancelled-lesson guard, the price snapshot, the payment idempotency key, the payment id, amount and zero-amount checks, the dummy bcrypt compare, the login lock, email normalization. All 12 mutants are killed.
+**Mutation-checked.** [`npm run mutants`](scripts/mutants.ts) removes each defence in turn in a throwaway copy and runs the suite: either lock, `FOR UPDATE` instead of `FOR NO KEY UPDATE`, the cancelled-lesson guard, the one-reversal-per-charge constraint, the reversal-matches-charge trigger, the mapping of a lost reversal race to a retryable error, the price snapshot, the payment idempotency key, the payment id, amount and zero-amount checks, the dummy bcrypt compare, the login lock, email normalization. All 15 mutants are killed.
 
 ### A bug the invariant test caught
 
 The first run of the randomized test failed on *"a cancelled lesson nets to zero for every student"*. The sequence: a student is charged, the lesson is cancelled (the charge is reversed), then the attendance mark is cleared, which reversed the charge a second time. The student was credited for a lesson they were never charged for.
 
 The fix: clearing refuses a cancelled lesson, and the check runs under the lesson's share lock, so a cancellation committing at the same moment can't slip between check and write. Both the plain case and the race are now tests; the race test fails if the share lock is removed.
+
+Since then the guarantee also lives in the schema: every reversal names the charge it reverses, and a `UNIQUE` constraint on that column refuses a second reversal of the same charge at insert. A future code path that forgets the check, or acts on a stale read, gets an error instead of a wrong balance.
 
 ## Layout
 
@@ -65,7 +67,9 @@ src/
   rate-limit/rate-limit.ts     atomic Postgres rate limiter
   db.ts                        pool, transaction helper
 migrations/001_init.sql        schema, CHECK constraints, append-only trigger
-tests/                         104 integration tests
+migrations/002_reversal_reference.sql
+                               each reversal names its charge; one reversal per charge
+tests/                         110 integration tests
 scripts/mutants.ts             mutation check: npm run mutants
 ```
 

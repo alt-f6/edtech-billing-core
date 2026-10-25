@@ -30,11 +30,19 @@ export function createPool(connectionString = process.env.DATABASE_URL): Db {
 export const PgError = {
   serializationFailure: "40001",
   deadlockDetected: "40P01",
+  uniqueViolation: "23505",
 } as const;
 
 export function pgErrorCode(err: unknown): string | undefined {
   return typeof err === "object" && err !== null && "code" in err
     ? String((err as { code: unknown }).code)
+    : undefined;
+}
+
+/** The constraint a Postgres error names, e.g. on a unique violation. */
+export function pgErrorConstraint(err: unknown): string | undefined {
+  return typeof err === "object" && err !== null && "constraint" in err
+    ? String((err as { constraint: unknown }).constraint)
     : undefined;
 }
 

@@ -1,4 +1,4 @@
-import { type Db, type Tx, PgError, pgErrorCode, withTransaction } from "../db.js";
+import { type Db, type Tx, PgError, pgErrorCode, pgErrorConstraint, withTransaction } from "../db.js";
 import { BillingRuleError, ConcurrentUpdateError, NotFoundError } from "../errors.js";
 
 export type AttendanceStatus = "PRESENT" | "ABSENT" | "EXCUSED";
@@ -144,21 +144,15 @@ export async function cancelSession(db: Db, classSessionId: string): Promise<num
 
     // Read after taking the lesson lock: every mark or clear that held the
     // lesson's share lock has committed by now, so these nets are final.
-    const outstanding = await tx.query<{ student_id: string; net: number; rows: number }>(
-      `SELECT student_id, SUM(amount)::bigint AS net, COUNT(*)::int AS rows
-       FROM ledger_transaction WHERE class_session_id = $1
+    const outstanding = await tx.query<{ student_id: string }>(
+      `SELECT student_id FROM ledger_transaction WHERE class_session_id = $1
        GROUP BY student_id HAVING SUM(amount) <> 0
        ORDER BY student_id`,
       [classSessionId],
     );
     for (const row of outstanding.rows) {
-      await moveLessonNet(tx, {
-        studentId: row.student_id,
-        classSessionId,
-        ledger: { net: row.net, rows: row.rows },
-        target: 0,
-        why: "lesson cancelled",
-      });
+      const ledger = await lessonLedger(tx, row.student_id, classSessionId);
+      await moveLessonNet(tx, { studentId: row.student_id, classSessionId, ledger, target: 0, why: "lesson cancelled" });
     }
 
     await tx.query(`UPDATE class_session SET is_cancelled = TRUE WHERE id = $1`, [classSessionId]);
@@ -187,6 +181,8 @@ interface SessionRow {
 interface LessonLedger {
   net: number;
   rows: number;
+  /** The lesson's charge that no reversal names yet, if any. */
+  openChargeId: string | null;
 }
 
 async function inTransaction<T>(db: Db, fn: (tx: Tx) => Promise<T>): Promise<T> {
@@ -197,6 +193,12 @@ async function inTransaction<T>(db: Db, fn: (tx: Tx) => Promise<T>): Promise<T> 
     // net so an unexpected lost race still surfaces as a typed, retryable error.
     const code = pgErrorCode(err);
     if (code === PgError.deadlockDetected || code === PgError.serializationFailure) {
+      throw new ConcurrentUpdateError({ cause: err });
+    }
+    // Another transaction reversed the same charge first: this one acted on a
+    // stale read. The schema refused the second reversal; re-reading and
+    // retrying sees the charge as already reversed and writes nothing.
+    if (code === PgError.uniqueViolation && pgErrorConstraint(err) === "ledger_charge_reversed_once") {
       throw new ConcurrentUpdateError({ cause: err });
     }
     throw err;
@@ -220,16 +222,23 @@ async function lockSessionShared(tx: Tx, classSessionId: string): Promise<Sessio
 
 async function lessonLedger(tx: Tx, studentId: string, classSessionId: string): Promise<LessonLedger> {
   const { rows } = await tx.query<LessonLedger>(
-    `SELECT COALESCE(SUM(amount), 0)::bigint AS net, COUNT(*)::int AS rows
-     FROM ledger_transaction WHERE student_id = $1 AND class_session_id = $2`,
+    `SELECT COALESCE(SUM(t.amount), 0)::bigint AS net,
+            COUNT(*)::int AS rows,
+            (array_agg(t.id ORDER BY t.created_at DESC) FILTER (
+               WHERE t.type = 'LESSON_CHARGE'
+                 AND NOT EXISTS (SELECT 1 FROM ledger_transaction r WHERE r.reverses_id = t.id)
+             ))[1] AS "openChargeId"
+     FROM ledger_transaction t WHERE t.student_id = $1 AND t.class_session_id = $2`,
     [studentId, classSessionId],
   );
-  return rows[0] ?? { net: 0, rows: 0 };
+  return rows[0] ?? { net: 0, rows: 0, openChargeId: null };
 }
 
 /**
  * Appends the rows that take a lesson's net from its current value to
  * `target`: a reversal of the outstanding charge, then the new charge.
+ * The reversal names the charge it undoes (reverses_id); the schema allows
+ * one reversal per charge, so a stale or repeated reversal fails at insert.
  * Idempotency keys are numbered per lesson under the student lock, so they are
  * deterministic, and a replayed write collides on the UNIQUE key instead of
  * being applied twice.
@@ -240,16 +249,23 @@ async function moveLessonNet(
 ): Promise<number> {
   if (p.ledger.net === p.target) return 0;
   let seq = p.ledger.rows;
-  const append = (type: "LESSON_CHARGE" | "CHARGE_REVERSAL", amount: number, description: string) =>
+  const append = (
+    type: "LESSON_CHARGE" | "CHARGE_REVERSAL",
+    amount: number,
+    description: string,
+    reversesId: string | null = null,
+  ) =>
     tx.query(
-      `INSERT INTO ledger_transaction (student_id, class_session_id, amount, type, description, idempotency_key)
-       VALUES ($1, $2, $3, $4, $5, $6)`,
-      [p.studentId, p.classSessionId, amount, type, description, `lesson:${p.classSessionId}:${p.studentId}:${++seq}`],
+      `INSERT INTO ledger_transaction (student_id, class_session_id, amount, type, description, idempotency_key, reverses_id)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [p.studentId, p.classSessionId, amount, type, description, `lesson:${p.classSessionId}:${p.studentId}:${++seq}`, reversesId],
     );
 
   let written = 0;
   if (p.ledger.net !== 0) {
-    await append("CHARGE_REVERSAL", -p.ledger.net, `Reversal: ${p.why}`);
+    // A non-zero net is exactly one charge that nothing has reversed yet.
+    if (!p.ledger.openChargeId) throw new Error(`Lesson ${p.classSessionId} has a net of ${p.ledger.net} but no open charge`);
+    await append("CHARGE_REVERSAL", -p.ledger.net, `Reversal: ${p.why}`, p.ledger.openChargeId);
     written++;
   }
   if (p.target !== 0) {
