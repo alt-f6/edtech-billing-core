@@ -45,7 +45,8 @@ for (const entry of ["src", "tests", "scripts", "migrations", "package.json", "t
     // .env is optional
   }
 }
-symlinkSync(join(root, "node_modules"), join(work, "node_modules"));
+// A junction needs no admin rights on Windows; the type is ignored elsewhere.
+symlinkSync(join(root, "node_modules"), join(work, "node_modules"), "junction");
 
 let survivors = 0;
 try {
@@ -55,12 +56,23 @@ try {
     if (!original.includes(mutant.from)) throw new Error(`Mutant "${mutant.name}": pattern not found in ${mutant.file}`);
     writeFileSync(path, original.replace(mutant.from, mutant.to));
 
-    const run = spawnSync("npx", ["vitest", "run", "--testTimeout=8000"], { cwd: work, encoding: "utf8", timeout: 300_000 });
+    // npx is npx.cmd on Windows, which only runs through a shell.
+    const run = spawnSync("npx", ["vitest", "run", "--testTimeout=8000"], {
+      cwd: work,
+      encoding: "utf8",
+      timeout: 300_000,
+      shell: process.platform === "win32",
+    });
     writeFileSync(path, original);
 
+    // A suite that never ran also exits non-zero. Count a mutant as killed
+    // only when the tests actually ran and some of them failed.
+    const summary = /Tests\s+([^\n]+)/.exec(run.stdout ?? "")?.[1]?.trim();
+    if (!summary) {
+      throw new Error(`Mutant "${mutant.name}": the test suite did not run\n${run.error ?? run.stderr ?? ""}`);
+    }
     const killed = run.status !== 0;
     if (!killed) survivors++;
-    const summary = /Tests\s+([^\n]+)/.exec(run.stdout ?? "")?.[1]?.trim() ?? "no summary";
     console.log(`${killed ? "killed  " : "SURVIVED"}  ${mutant.name.padEnd(42)} ${summary}`);
   }
 } finally {
