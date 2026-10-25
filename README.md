@@ -14,22 +14,22 @@ docker compose up -d --wait && cp .env.example .env && npm ci && npm test
 
 ## What's inside
 
-| Module | The problem | The design |
-|---|---|---|
-| [`billing`](src/billing/billing.service.ts) | Staff mark, re-mark, clear and cancel lessons concurrently; the student must be charged exactly once, and the ledger must always agree with the attendance journal | **Append-only ledger** (a trigger rejects `UPDATE`/`DELETE`): corrections are reversal rows, each naming the charge it reverses, and a `UNIQUE` constraint lets a charge be reversed only once. Writes for one student are ordered by a `FOR NO KEY UPDATE` lock on the student; cancellations exclude marks via `FOR SHARE` / `FOR UPDATE` on the lesson. One lock order everywhere, so no deadlocks and no lost races to retry |
-| [`payments`](src/payments/webhook.handler.ts) | A webhook can be forged, replayed, tampered with, or delivered ten times at once | Rate limit → constant-time secret check (mandatory in live mode) → provider IP allowlist → **re-fetch the payment from the provider's API** and validate the response at runtime → check owner, amount and currency against our own payment intent → credit with `ON CONFLICT DO NOTHING` on the provider's payment id |
-| [`auth`](src/auth/login-rate-limit.ts) | Response time leaks which emails are registered; per-IP limits are bypassed by spoofing `X-Forwarded-For`; check-then-increment limiters let bursts through | Unknown emails still cost one bcrypt compare. Limits per (IP, email) and per email across IPs, checked and counted atomically under a per-email advisory lock, on normalized emails, with IPs stored only as keyed hashes (HMAC) |
-| [`rate-limit`](src/rate-limit/rate-limit.ts) | An in-memory limiter resets on deploy and isn't shared between instances | One atomic `INSERT … ON CONFLICT DO UPDATE` per hit, in Postgres |
-| [`money`](src/money.ts) | `Number("0.29") * 100` is `28.999…` | Kopecks as safe integers throughout; provider amounts parsed from the decimal string, never through a float; the DB driver refuses `BIGINT`s beyond 2^53 |
+| Module                                        | The problem                                                                                                                                                        | The design                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`billing`](src/billing/billing.service.ts)   | Staff mark, re-mark, clear and cancel lessons concurrently; the student must be charged exactly once, and the ledger must always agree with the attendance journal | **Append-only ledger** (a trigger rejects `UPDATE`/`DELETE`): corrections are reversal rows, each naming the charge it reverses, and a `UNIQUE` constraint lets a charge be reversed only once. Writes for one student are ordered by a `FOR NO KEY UPDATE` lock on the student; cancellations exclude marks via `FOR SHARE` / `FOR UPDATE` on the lesson. One lock order everywhere, so no deadlocks and no lost races to retry |
+| [`payments`](src/payments/webhook.handler.ts) | A webhook can be forged, replayed, tampered with, or delivered ten times at once                                                                                   | Rate limit → constant-time secret check (mandatory in live mode) → provider IP allowlist → **re-fetch the payment from the provider's API** and validate the response at runtime → check owner, amount and currency against our own payment intent → credit with `ON CONFLICT DO NOTHING` on the provider's payment id                                                                                                           |
+| [`auth`](src/auth/login-rate-limit.ts)        | Response time leaks which emails are registered; per-IP limits are bypassed by spoofing `X-Forwarded-For`; check-then-increment limiters let bursts through        | Unknown emails still cost one bcrypt compare. Limits per (IP, email) and per email across IPs, checked and counted atomically under a per-email advisory lock, on normalized emails, with IPs stored only as keyed hashes (HMAC)                                                                                                                                                                                                 |
+| [`rate-limit`](src/rate-limit/rate-limit.ts)  | An in-memory limiter resets on deploy and isn't shared between instances                                                                                           | One atomic `INSERT … ON CONFLICT DO UPDATE` per hit, in Postgres                                                                                                                                                                                                                                                                                                                                                                 |
+| [`money`](src/money.ts)                       | `Number("0.29") * 100` is `28.999…`                                                                                                                                | Kopecks as safe integers throughout; provider amounts parsed from the decimal string, never through a float; the DB driver refuses `BIGINT`s beyond 2^53                                                                                                                                                                                                                                                                         |
 
 ## Locking
 
 Every billing write takes its locks in the same order:
 
-| Operation | 1. student row | 2. lesson row |
-|---|---|---|
-| mark, clear | `FOR NO KEY UPDATE` | `FOR SHARE` |
-| cancel | (only `KEY SHARE`, via foreign-key checks) | `FOR UPDATE` |
+| Operation   | 1. student row                             | 2. lesson row |
+| ----------- | ------------------------------------------ | ------------- |
+| mark, clear | `FOR NO KEY UPDATE`                        | `FOR SHARE`   |
+| cancel      | (only `KEY SHARE`, via foreign-key checks) | `FOR UPDATE`  |
 
 - Two writes for the same student run one after the other; each re-reads the committed state after its lock wait, so plain `READ COMMITTED` is enough.
 - Marks on the same lesson coexist; a cancellation waits for in-flight marks and they wait for it. So "is this lesson cancelled?" can't change between the check and the write.
@@ -48,9 +48,9 @@ Every billing write takes its locks in the same order:
 
 ### A bug the invariant test caught
 
-The first run of the randomized test failed on *"a cancelled lesson nets to zero for every student"*. The sequence: a student is charged, the lesson is cancelled (the charge is reversed), then the attendance mark is cleared, which reversed the charge a second time. The student was credited for a lesson they were never charged for.
+The first run of the randomized test failed on _"a cancelled lesson nets to zero for every student"_. The sequence: a student is charged, the lesson is cancelled (the charge is reversed), then the attendance mark is cleared, which reversed the charge a second time. The student was credited for a lesson they were never charged for.
 
-The fix: clearing refuses a cancelled lesson, and the check runs under the lesson's share lock, so a cancellation committing at the same moment can't slip between check and write. Both the plain case and the race are now tests; the race test fails if the share lock is removed.
+The fix: clearing and cancelling both compute the reversal from the lesson's current net, under the lesson's lock, so a clear after a cancellation finds nothing to reverse. Clearing also refuses a cancelled lesson outright, as a business rule. Both the plain sequence and the race are now tests; the race test fails if the share lock is removed.
 
 Since then the guarantee also lives in the schema: every reversal names the charge it reverses, and a `UNIQUE` constraint on that column refuses a second reversal of the same charge at insert. A future code path that forgets the check, or acts on a stale read, gets an error instead of a wrong balance.
 
@@ -79,7 +79,7 @@ The production system runs on Next.js with Prisma. This extraction uses `pg` wit
 
 Two parts were redesigned here after review, and the reasons apply back to production:
 
-- **Locking.** Production wraps billing in `SERIALIZABLE` transactions *and* takes `SELECT … FOR UPDATE` on the student. The first version of this extraction copied that design, and an ad-hoc concurrency probe during code review showed the cost: roughly 9 in 10 concurrent writes aborted with serialization failures, and `FOR UPDATE` deadlocked against a cancellation's foreign-key checks. This version uses one explicit lock order under `READ COMMITTED` instead, and every concurrent call in the burst tests succeeds.
+- **Locking.** Production wraps billing in `SERIALIZABLE` transactions _and_ takes `SELECT … FOR UPDATE` on the student. The first version of this extraction copied that design, and an ad-hoc concurrency probe during code review showed the cost: roughly 9 in 10 concurrent writes aborted with serialization failures, and `FOR UPDATE` deadlocked against a cancellation's foreign-key checks. This version uses one explicit lock order under `READ COMMITTED` instead, and every concurrent call in the burst tests succeeds.
 - **Ledger history.** Production deletes and rewrites a lesson's charge when attendance changes. Here the ledger is append-only and enforced by the database, so every balance can be explained row by row.
 
 ## Running it
